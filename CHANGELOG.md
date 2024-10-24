@@ -1,3 +1,9 @@
+## 0.16.2-dev
+
+### Fixes
+
+* **Use password** to load PDF with all modes
+
 ## 0.16.1
 
 ### Enhancements

@@ -401,6 +401,7 @@ def _partition_pdf_with_pdfminer(
                 languages=languages,
                 metadata_last_modified=metadata_last_modified,
                 starting_page_number=starting_page_number,
+                password=password,
                 **kwargs,
             )
 
@@ -598,7 +599,8 @@ def _partition_pdf_or_image_local(
         )
 
         extracted_layout = (
-            process_file_with_pdfminer(filename=filename, dpi=pdf_image_dpi)
+            process_file_with_pdfminer(filename=filename, dpi=pdf_image_dpi,
+                                       password=password)
             if pdf_text_extractable
             else []
         )
@@ -696,6 +698,7 @@ def _partition_pdf_or_image_local(
             ocr_mode=ocr_mode,
             pdf_image_dpi=pdf_image_dpi,
             ocr_layout_dumper=ocr_layout_dumper,
+            password=password,
         )
 
     final_document_layout = clean_pdfminer_inner_elements(final_document_layout)
