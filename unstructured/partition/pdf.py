@@ -18,6 +18,8 @@ from pdfminer.utils import open_filename
 from pi_heif import register_heif_opener
 from PIL import Image as PILImage
 from pypdf import PdfReader
+from unstructured_inference.inference.layout import DocumentLayout
+from unstructured_inference.inference.layoutelement import LayoutElement
 
 from unstructured.chunking import add_chunking_strategy
 from unstructured.cleaners.core import (
@@ -35,6 +37,7 @@ from unstructured.documents.elements import (
     ListItem,
     PageBreak,
     Text,
+    Title,
     process_metadata,
 )
 from unstructured.errors import PageCountExceededError
@@ -43,8 +46,10 @@ from unstructured.file_utils.model import FileType
 from unstructured.logger import logger, trace_logger
 from unstructured.nlp.patterns import PARAGRAPH_PATTERN
 from unstructured.partition.common.common import (
-    document_to_element_list,
+    add_element_metadata,
     exactly_one,
+    get_page_image_metadata,
+    normalize_layout_element,
     ocr_data_to_elements,
     spooled_to_bytes_io_if_needed,
 )
@@ -68,7 +73,12 @@ from unstructured.partition.pdf_image.pdf_image_utils import (
     save_elements,
 )
 from unstructured.partition.pdf_image.pdfminer_processing import (
+    check_annotations_within_element,
     clean_pdfminer_inner_elements,
+    get_links_in_element,
+    get_uris,
+    get_words_from_obj,
+    map_bbox_and_index,
     merge_inferred_with_extracted_layout,
 )
 from unstructured.partition.pdf_image.pdfminer_utils import (
@@ -88,7 +98,7 @@ from unstructured.partition.utils.constants import (
 )
 from unstructured.partition.utils.sorting import coord_has_valid_points, sort_page_elements
 from unstructured.patches.pdfminer import parse_keyword
-from unstructured.utils import requires_dependencies
+from unstructured.utils import first, requires_dependencies
 
 if TYPE_CHECKING:
     pass
@@ -598,11 +608,10 @@ def _partition_pdf_or_image_local(
             password=password,
         )
 
-        extracted_layout = (
-            process_file_with_pdfminer(filename=filename, dpi=pdf_image_dpi,
-                                       password=password)
+        extracted_layout, layouts_links = (
+            process_file_with_pdfminer(filename=filename, dpi=pdf_image_dpi)
             if pdf_text_extractable
-            else []
+            else ([], [])
         )
 
         if analysis:
@@ -654,12 +663,11 @@ def _partition_pdf_or_image_local(
         if hasattr(file, "seek"):
             file.seek(0)
 
-            extracted_layout = (
-                process_data_with_pdfminer(file=file, dpi=pdf_image_dpi,
-                                           password=password)
-                if pdf_text_extractable
-                else []
-            )
+        extracted_layout, layouts_links = (
+            process_data_with_pdfminer(file=file, dpi=pdf_image_dpi)
+            if pdf_text_extractable
+            else ([], [])
+        )
 
         if analysis:
             if not analyzed_image_output_dir_path:
@@ -698,7 +706,6 @@ def _partition_pdf_or_image_local(
             ocr_mode=ocr_mode,
             pdf_image_dpi=pdf_image_dpi,
             ocr_layout_dumper=ocr_layout_dumper,
-            password=password,
         )
 
     final_document_layout = clean_pdfminer_inner_elements(final_document_layout)
@@ -718,6 +725,7 @@ def _partition_pdf_or_image_local(
         infer_list_items=False,
         languages=languages,
         starting_page_number=starting_page_number,
+        layouts_links=layouts_links,
         **kwargs,
     )
 
@@ -735,7 +743,6 @@ def _partition_pdf_or_image_local(
             pdf_image_dpi=pdf_image_dpi,
             extract_image_block_to_payload=extract_image_block_to_payload,
             output_dir_path=extract_image_block_output_dir,
-            password=password,
         )
 
     for el_type in extract_image_block_types:
@@ -807,7 +814,6 @@ def _partition_pdf_or_image_local(
             draw_caption=env_config.ANALYSIS_BBOX_DRAW_CAPTION,
             resize=env_config.ANALYSIS_BBOX_RESIZE,
             format=env_config.ANALYSIS_BBOX_FORMAT,
-            password=password,
         )
 
     return out_elements
@@ -846,7 +852,6 @@ def _partition_pdf_or_image_with_ocr(
     is_image: bool = False,
     metadata_last_modified: Optional[str] = None,
     starting_page_number: int = 1,
-    password:Optional[str] = None,
     **kwargs: Any,
 ):
     """Partitions an image or PDF using OCR. For PDFs, each page is converted
@@ -871,8 +876,7 @@ def _partition_pdf_or_image_with_ocr(
             elements.extend(page_elements)
     else:
         for page_number, image in enumerate(
-            convert_pdf_to_images(filename, file, password=password),
-                start=starting_page_number
+            convert_pdf_to_images(filename, file), start=starting_page_number
         ):
             page_elements = _partition_pdf_or_image_with_ocr_from_image(
                 image=image,
@@ -1102,241 +1106,60 @@ def check_coords_within_boundary(
     return x_within_boundary and y_within_boundary
 
 
-def get_uris(
-    annots: PDFObjRef | list[PDFObjRef],
-    height: float,
-    coordinate_system: PixelSpace | PointSpace,
-    page_number: int,
-) -> list[dict[str, Any]]:
-    """
-    Extracts URI annotations from a single or a list of PDF object references on a specific page.
-    The type of annots (list or not) depends on the pdf formatting. The function detectes the type
-    of annots and then pass on to get_uris_from_annots function as a list.
+def document_to_element_list(
+    document: DocumentLayout,
+    sortable: bool = False,
+    include_page_breaks: bool = False,
+    last_modification_date: Optional[str] = None,
+    infer_list_items: bool = True,
+    source_format: Optional[str] = None,
+    detection_origin: Optional[str] = None,
+    sort_mode: str = SORT_MODE_XY_CUT,
+    languages: Optional[list[str]] = None,
+    starting_page_number: int = 1,
+    layouts_links: Optional[list[list]] = None,
+    **kwargs: Any,
+) -> list[Element]:
+    """Converts a DocumentLayout object to a list of unstructured elements."""
+    elements: list[Element] = []
 
-    Args:
-        annots (PDFObjRef | list[PDFObjRef]): A single or a list of PDF object references
-            representing annotations on the page.
-        height (float): The height of the page in the specified coordinate system.
-        coordinate_system (PixelSpace | PointSpace): The coordinate system used to represent
-            the annotations' coordinates.
-        page_number (int): The page number from which to extract annotations.
+    num_pages = len(document.pages)
+    for page_number, page in enumerate(document.pages, start=starting_page_number):
+        page_elements: list[Element] = []
 
-    Returns:
-        list[dict]: A list of dictionaries, each containing information about a URI annotation,
-        including its coordinates, bounding box, type, URI link, and page number.
-    """
-    if isinstance(annots, list):
-        return get_uris_from_annots(annots, height, coordinate_system, page_number)
-    resolved_annots = annots.resolve()
-    if resolved_annots is None:
-        return []
-    return get_uris_from_annots(resolved_annots, height, coordinate_system, page_number)
+        page_image_metadata = get_page_image_metadata(page)
+        image_format = page_image_metadata.get("format")
+        image_width = page_image_metadata.get("width")
+        image_height = page_image_metadata.get("height")
 
+        translation_mapping: list[tuple["LayoutElement", Element]] = []
 
-def get_uris_from_annots(
-    annots: list[PDFObjRef],
-    height: int | float,
-    coordinate_system: PixelSpace | PointSpace,
-    page_number: int,
-) -> list[dict[str, Any]]:
-    """
-    Extracts URI annotations from a list of PDF object references.
-
-    Args:
-        annots (list[PDFObjRef]): A list of PDF object references representing annotations on
-            a page.
-        height (int | float): The height of the page in the specified coordinate system.
-        coordinate_system (PixelSpace | PointSpace): The coordinate system used to represent
-            the annotations' coordinates.
-        page_number (int): The page number from which to extract annotations.
-
-    Returns:
-        list[dict]: A list of dictionaries, each containing information about a URI annotation,
-        including its coordinates, bounding box, type, URI link, and page number.
-    """
-    annotation_list = []
-    for annotation in annots:
-        # Check annotation is valid for extraction
-        annotation_dict = try_resolve(annotation)
-        if not isinstance(annotation_dict, dict):
-            continue
-        subtype = annotation_dict.get("Subtype", None)
-        if not subtype or isinstance(subtype, PDFObjRef) or str(subtype) != "/'Link'":
-            continue
-        # Extract bounding box and update coordinates
-        rect = annotation_dict.get("Rect", None)
-        if not rect or isinstance(rect, PDFObjRef) or len(rect) != 4:
-            continue
-        x1, y1, x2, y2 = rect_to_bbox(rect, height)
-        points = ((x1, y1), (x1, y2), (x2, y2), (x2, y1))
-        coordinates_metadata = CoordinatesMetadata(
-            points=points,
-            system=coordinate_system,
+        links = (
+            layouts_links[page_number - starting_page_number]
+            if layouts_links and layouts_links[0]
+            else None
         )
-        # Extract type
-        if "A" not in annotation_dict:
-            continue
-        uri_dict = try_resolve(annotation_dict["A"])
-        if not isinstance(uri_dict, dict):
-            continue
-        uri_type = None
-        if "S" in uri_dict and not isinstance(uri_dict["S"], PDFObjRef):
-            uri_type = str(uri_dict["S"])
-        # Extract URI link
-        uri = None
-        try:
-            if uri_type == "/'URI'":
-                uri = try_resolve(try_resolve(uri_dict["URI"])).decode("utf-8")
-            if uri_type == "/'GoTo'":
-                uri = try_resolve(try_resolve(uri_dict["D"])).decode("utf-8")
-        except Exception:
-            pass
 
-        annotation_list.append(
-            {
-                "coordinates": coordinates_metadata,
-                "bbox": (x1, y1, x2, y2),
-                "type": uri_type,
-                "uri": uri,
-                "page_number": page_number,
-            },
-        )
-    return annotation_list
+        for layout_element in page.elements:
+            if image_width and image_height and hasattr(layout_element.bbox, "coordinates"):
+                coordinate_system = PixelSpace(width=image_width, height=image_height)
+            else:
+                coordinate_system = None
 
-
-def try_resolve(annot: PDFObjRef):
-    """
-    Attempt to resolve a PDF object reference. If successful, returns the resolved object;
-    otherwise, returns the original reference.
-    """
-    try:
-        return annot.resolve()
-    except Exception:
-        return annot
-
-
-def calculate_intersection_area(
-    bbox1: tuple[float, float, float, float],
-    bbox2: tuple[float, float, float, float],
-) -> float:
-    """
-    Calculate the area of intersection between two bounding boxes.
-
-    Args:
-        bbox1 (tuple[float, float, float, float]): The coordinates of the first bounding box
-            in the format (x1, y1, x2, y2).
-        bbox2 (tuple[float, float, float, float]): The coordinates of the second bounding box
-            in the format (x1, y1, x2, y2).
-
-    Returns:
-        float: The area of intersection between the two bounding boxes. If there is no
-        intersection, the function returns 0.0.
-    """
-    x1_1, y1_1, x2_1, y2_1 = bbox1
-    x1_2, y1_2, x2_2, y2_2 = bbox2
-
-    x_intersection = max(x1_1, x1_2)
-    y_intersection = max(y1_1, y1_2)
-    x2_intersection = min(x2_1, x2_2)
-    y2_intersection = min(y2_1, y2_2)
-
-    if x_intersection < x2_intersection and y_intersection < y2_intersection:
-        intersection_area = calculate_bbox_area(
-            (x_intersection, y_intersection, x2_intersection, y2_intersection),
-        )
-        return intersection_area
-    else:
-        return 0.0
-
-
-def calculate_bbox_area(bbox: tuple[float, float, float, float]) -> float:
-    """
-    Calculate the area of a bounding box.
-
-    Args:
-        bbox (tuple[float, float, float, float]): The coordinates of the bounding box
-            in the format (x1, y1, x2, y2).
-
-    Returns:
-        float: The area of the bounding box, computed as the product of its width and height.
-    """
-    x1, y1, x2, y2 = bbox
-    area = (x2 - x1) * (y2 - y1)
-    return area
-
-
-def check_annotations_within_element(
-    annotation_list: list[dict[str, Any]],
-    element_bbox: tuple[float, float, float, float],
-    page_number: int,
-    annotation_threshold: float,
-) -> list[dict[str, Any]]:
-    """
-    Filter annotations that are within or highly overlap with a specified element on a page.
-
-    Args:
-        annotation_list (list[dict[str,Any]]): A list of dictionaries, each containing information
-            about an annotation.
-        element_bbox (tuple[float, float, float, float]): The bounding box coordinates of the
-            specified element in the bbox format (x1, y1, x2, y2).
-        page_number (int): The page number to which the annotations and element belong.
-        annotation_threshold (float, optional): The threshold value (between 0.0 and 1.0)
-            that determines the minimum overlap required for an annotation to be considered
-            within the element. Default is 0.9.
-
-    Returns:
-        list[dict[str,Any]]: A list of dictionaries containing information about annotations
-        that are within or highly overlap with the specified element on the given page, based on
-        the specified threshold.
-    """
-    annotations_within_element = []
-    for annotation in annotation_list:
-        if annotation["page_number"] == page_number:
-            annotation_bbox_size = calculate_bbox_area(annotation["bbox"])
-            if annotation_bbox_size and (
-                calculate_intersection_area(element_bbox, annotation["bbox"]) / annotation_bbox_size
-                > annotation_threshold
-            ):
-                annotations_within_element.append(annotation)
-    return annotations_within_element
-
-
-def get_word_bounding_box_from_element(
-    obj: LTTextBox,
-    height: float,
-) -> tuple[list[LTChar], list[dict[str, Any]]]:
-    """
-    Extracts characters and word bounding boxes from a PDF text element.
-
-    Args:
-        obj (LTTextBox): The PDF text element from which to extract characters and words.
-        height (float): The height of the page in the specified coordinate system.
-
-    Returns:
-        tuple[list[LTChar], list[dict[str,Any]]]: A tuple containing two lists:
-            - list[LTChar]: A list of LTChar objects representing individual characters.
-            - list[dict[str,Any]]]: A list of dictionaries, each containing information about
-                a word, including its text, bounding box, and start index in the element's text.
-    """
-    characters = []
-    words = []
-    text_len = 0
-
-    for text_line in obj:
-        word = ""
-        x1, y1, x2, y2 = None, None, None, None
-        start_index = 0
-        for index, character in enumerate(text_line):
-            if isinstance(character, LTChar):
-                characters.append(character)
-                char = character.get_text()
-
-                if word and not char.strip():
-                    words.append(
-                        {"text": word, "bbox": (x1, y1, x2, y2), "start_index": start_index},
-                    )
-                    word = ""
-                    continue
+            element = normalize_layout_element(
+                layout_element,
+                coordinate_system=coordinate_system,
+                infer_list_items=infer_list_items,
+                source_format=source_format if source_format else "html",
+            )
+            if isinstance(element, list):
+                for el in element:
+                    if last_modification_date:
+                        el.metadata.last_modified = last_modification_date
+                    el.metadata.page_number = page_number
+                page_elements.extend(element)
+                translation_mapping.extend([(layout_element, el) for el in element])
+                continue
 
                 # TODO(klaijan) - isalnum() only works with A-Z, a-z and 0-9
                 # will need to switch to some pattern matching once we support more languages
@@ -1355,70 +1178,57 @@ def get_word_bounding_box_from_element(
                     y2 = height - character.y0
                     x2 = character.x1
                     y1 = height - character.y1
-                else:
-                    x2 = character.x1
-                    y2 = height - character.y0
+            else:
 
-                word += char
-        text_len += len(text_line)
-    return characters, words
+                element.metadata.links = (
+                    get_links_in_element(links, layout_element.bbox) if links else []
+                )
 
+                if last_modification_date:
+                    element.metadata.last_modified = last_modification_date
+                element.metadata.text_as_html = getattr(layout_element, "text_as_html", None)
+                element.metadata.table_as_cells = getattr(layout_element, "table_as_cells", None)
 
-def map_bbox_and_index(words: list[dict[str, Any]], annot: dict[str, Any]):
-    """
-    Maps a bounding box annotation to the corresponding text and start index within a list of words.
+                if (isinstance(element, Title) and element.metadata.category_depth is None) and any(
+                    getattr(el, "type", "") in ["Headline", "Subheadline"] for el in page.elements
+                ):
+                    element.metadata.category_depth = 0
 
-    Args:
-        words (list[dict[str,Any]]): A list of dictionaries, each containing information about
-            a word, including its text, bounding box, and start index.
-        annot (dict[str,Any]): The annotation dictionary to be mapped, which will be updated with
-        "text" and "start_index" fields.
+                page_elements.append(element)
+                translation_mapping.append((layout_element, element))
+            coordinates = (
+                element.metadata.coordinates.points if element.metadata.coordinates else None
+            )
 
-    Returns:
-        dict: The updated annotation dictionary with "text" representing the mapped text and
-            "start_index" representing the start index of the mapped text in the list of words.
-    """
-    if len(words) == 0:
-        annot["text"] = ""
-        annot["start_index"] = -1
-        return annot
-    distance_from_bbox_start = np.sqrt(
-        (annot["bbox"][0] - np.array([word["bbox"][0] for word in words])) ** 2
-        + (annot["bbox"][1] - np.array([word["bbox"][1] for word in words])) ** 2,
-    )
-    distance_from_bbox_end = np.sqrt(
-        (annot["bbox"][2] - np.array([word["bbox"][2] for word in words])) ** 2
-        + (annot["bbox"][3] - np.array([word["bbox"][3] for word in words])) ** 2,
-    )
-    closest_start = try_argmin(distance_from_bbox_start)
-    closest_end = try_argmin(distance_from_bbox_end)
+            el_image_path = (
+                layout_element.image_path if hasattr(layout_element, "image_path") else None
+            )
 
-    # NOTE(klaijan) - get the word from closest start only if the end index comes after start index
-    text = ""
-    if closest_end >= closest_start:
-        for _ in range(closest_start, closest_end + 1):
-            text += " "
-            text += words[_]["text"]
-    else:
-        text = words[closest_start]["text"]
+            add_element_metadata(
+                element,
+                page_number=page_number,
+                filetype=image_format,
+                coordinates=coordinates,
+                coordinate_system=coordinate_system,
+                category_depth=element.metadata.category_depth,
+                image_path=el_image_path,
+                detection_origin=detection_origin,
+                languages=languages,
+                **kwargs,
+            )
 
-    annot["text"] = text.strip()
-    annot["start_index"] = words[closest_start]["start_index"]
-    return annot
+        for layout_element, element in translation_mapping:
+            if hasattr(layout_element, "parent") and layout_element.parent is not None:
+                element_parent = first(
+                    (el for l_el, el in translation_mapping if l_el is layout_element.parent),
+                )
+                element.metadata.parent_id = element_parent.id
+        sorted_page_elements = page_elements
+        if sortable and sort_mode != SORT_MODE_DONT:
+            sorted_page_elements = sort_page_elements(page_elements, sort_mode)
 
+        if include_page_breaks and page_number < num_pages + starting_page_number:
+            sorted_page_elements.append(PageBreak(text=""))
+        elements.extend(sorted_page_elements)
 
-def try_argmin(array: np.ndarray) -> int:
-    """
-    Attempt to find the index of the minimum value in a NumPy array.
-
-    Args:
-        array (np.ndarray): The NumPy array in which to find the minimum value's index.
-
-    Returns:
-        int: The index of the minimum value in the array. If the array is empty or an
-        IndexError occurs, it returns -1.
-    """
-    try:
-        return int(np.argmin(array))
-    except IndexError:
-        return -1
+    return elements
