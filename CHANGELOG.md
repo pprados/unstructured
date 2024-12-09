@@ -1,3 +1,15 @@
+## 0.16.10-dev0
+
+### Enhancements
+
+- **Enhance quote standardization tests with additional Unicode scenarios
+
+### Features
+
+### Fixes
+
+- **Fix original file doctype detection** from cct converted file paths for metrics calculation.
+
 ## 0.16.9
 
 ### Enhancements
