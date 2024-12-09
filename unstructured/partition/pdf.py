@@ -473,7 +473,7 @@ def _process_pdfminer_pages(
                     page_number,
                     annotation_threshold,
                 )
-                _, words = get_word_bounding_box_from_element(obj, height)
+                _, words = get_words_from_obj(obj, height)
                 for annot in annotations_within_element:
                     urls_metadata.append(map_bbox_and_index(words, annot))
 
@@ -609,7 +609,8 @@ def _partition_pdf_or_image_local(
         )
 
         extracted_layout, layouts_links = (
-            process_file_with_pdfminer(filename=filename, dpi=pdf_image_dpi)
+            process_file_with_pdfminer(filename=filename, dpi=pdf_image_dpi,
+                                       password=password)
             if pdf_text_extractable
             else ([], [])
         )
@@ -664,7 +665,7 @@ def _partition_pdf_or_image_local(
             file.seek(0)
 
         extracted_layout, layouts_links = (
-            process_data_with_pdfminer(file=file, dpi=pdf_image_dpi)
+            process_data_with_pdfminer(file=file, dpi=pdf_image_dpi, password=password)
             if pdf_text_extractable
             else ([], [])
         )
@@ -706,6 +707,7 @@ def _partition_pdf_or_image_local(
             ocr_mode=ocr_mode,
             pdf_image_dpi=pdf_image_dpi,
             ocr_layout_dumper=ocr_layout_dumper,
+            password=password,
         )
 
     final_document_layout = clean_pdfminer_inner_elements(final_document_layout)
@@ -852,6 +854,7 @@ def _partition_pdf_or_image_with_ocr(
     is_image: bool = False,
     metadata_last_modified: Optional[str] = None,
     starting_page_number: int = 1,
+    password: Optional[str] = None,
     **kwargs: Any,
 ):
     """Partitions an image or PDF using OCR. For PDFs, each page is converted
@@ -876,7 +879,8 @@ def _partition_pdf_or_image_with_ocr(
             elements.extend(page_elements)
     else:
         for page_number, image in enumerate(
-            convert_pdf_to_images(filename, file), start=starting_page_number
+            convert_pdf_to_images(filename, file, password=password),
+                start=starting_page_number
         ):
             page_elements = _partition_pdf_or_image_with_ocr_from_image(
                 image=image,
